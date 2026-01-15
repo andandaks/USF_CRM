@@ -12,49 +12,58 @@ import altair as alt
 # ==========================================
 # --- CONFIGURATION (SECURE) ---
 # ==========================================
-# Instead of hardcoding, we load these from Streamlit Secrets
 try:
     CLIENT_ID = st.secrets["azure"]["client_id"]
     TENANT_ID = st.secrets["azure"]["tenant_id"]
-    # We construct the authority URL here using the tenant ID
     AUTHORITY_URL = f"https://login.microsoftonline.com/{TENANT_ID}"
     
     ONEDRIVE_ROOT = st.secrets["onedrive"]["root_folder"]
     ONEDRIVE_DB_PATH = f'{ONEDRIVE_ROOT}/case_book_db.xlsx' 
     ONEDRIVE_PAYMENTS_PATH = f'{ONEDRIVE_ROOT}/Payments'
 except Exception as e:
-    st.error(f"Missing secrets configuration: {e}")
+    st.error(f"Missing secrets: {e}. Please add them in Streamlit Cloud settings.")
     st.stop()
 
 ENTITIES = ['sales', 'underwriter', 'client']
+SCOPES = ['Files.ReadWrite.All', 'User.Read']
 
 # ==========================================
-# --- AUTHENTICATION LOGIC ---
+# --- AUTHENTICATION LOGIC (DEVICE CODE FLOW) ---
 # ==========================================
 def get_access_token():
-    """Checks Session -> Cache -> Returns None if login needed."""
     if "onedrive_token" in st.session_state:
         return st.session_state["onedrive_token"]
-
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
-    scopes = ['Files.ReadWrite.All', 'User.Read']
-    
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(scopes, account=accounts[0])
-        if result and "access_token" in result:
-            st.session_state["onedrive_token"] = result['access_token']
-            return result['access_token']
-
     return None
 
-def trigger_login():
-    """Triggers browser popup."""
+def login_with_device_code():
+    """
+    Initiates Device Code Flow for headless environments (Streamlit Cloud).
+    """
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
-    result = app.acquire_token_interactive(scopes=['Files.ReadWrite.All', 'User.Read'])
+    
+    # 1. Initiate flow
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        st.error("Failed to create device flow. Check Azure App registration.")
+        return
+    
+    # 2. Show Code to User
+    st.warning(f"⚠️ **Action Required**")
+    st.markdown(f"""
+    1. Go to: [{flow['verification_uri']}]({flow['verification_uri']})  
+    2. Enter code: **{flow['user_code']}** """)
+    
+    # 3. Wait for user to complete login (Blocking)
+    with st.spinner("Waiting for you to sign in..."):
+        result = app.acquire_token_by_device_flow(flow)
+    
+    # 4. Handle Result
     if "access_token" in result:
         st.session_state["onedrive_token"] = result['access_token']
-        st.rerun() 
+        st.success("Login Successful!")
+        st.rerun()
+    else:
+        st.error(f"Login failed: {result.get('error_description')}")
 
 # ==========================================
 # --- CLOUD HELPERS ---
@@ -155,7 +164,7 @@ with st.sidebar:
     else:
         st.warning("⚠️ Disconnected")
         if st.button("🔌 Connect Microsoft"):
-            trigger_login()
+            login_with_device_code()
 
 def page_crm():
     st.title("UpShift CRM ☁️ (Excel on OneDrive)")
@@ -170,7 +179,6 @@ def page_crm():
                 if not st.session_state.df.empty:
                     st.session_state.df.columns = st.session_state.df.columns.str.strip().str.lower()
                 
-                # Standard Columns
                 required_cols = [
                     "unique case number in system", "date added", "responsible entity", 
                     "company name", "company number", "manager", "product type", 
@@ -178,16 +186,13 @@ def page_crm():
                     "returning client", "comment", "done"
                 ]
                 
-                # Init Empty
                 if st.session_state.df.empty:
                     st.session_state.df = pd.DataFrame(columns=required_cols)
                 
-                # Add missing
                 for c in required_cols:
                     if c not in st.session_state.df.columns:
                         st.session_state.df[c] = None
                 
-                # Types
                 if 'done' in st.session_state.df.columns:
                      st.session_state.df['done'] = st.session_state.df['done'].astype(str).str.title()
                 if 'sum' in st.session_state.df.columns:
@@ -292,13 +297,12 @@ def page_crm():
             curr = pd.DataFrame()
 
         if view_mode:
-            # Check if product type exists before mapping
             if 'product type' in curr.columns:
-                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, use_container_width=True, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, hide_index=True)
             else:
-                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, use_container_width=True, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, hide_index=True)
         else:
-            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, width=None, use_container_width=True, hide_index=True, num_rows="dynamic")
+            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, width=None, hide_index=True, num_rows="dynamic")
             if not edited.equals(curr):
                 st.session_state.df.update(edited)
                 st.rerun()
@@ -337,7 +341,7 @@ def page_archive():
         c1, c2 = st.columns(2)
         c1.metric("Total", len(done))
         c2.metric("Sum", f"£{pd.to_numeric(done['sum'], errors='coerce').sum():,.2f}")
-        st.dataframe(done, width=None, use_container_width=True, hide_index=True)
+        st.dataframe(done, width=None, hide_index=True)
 
 def page_loans():
     st.title("Loan Management (Cloud)")
@@ -360,7 +364,7 @@ def page_loans():
     
     st.altair_chart(alt.Chart(df).mark_bar().encode(
         x='Date:T', y='Sum:Q', color='Case ID:N', tooltip=['Date', 'Case ID', 'Sum']
-    ).interactive(), width=None, use_container_width=True)
+    ).interactive(), width=None)
 
 def page_calculator():
     st.title("🧮 Calculator")
@@ -405,7 +409,7 @@ def page_calculator():
                 data.append({"Period":i, "Date":curr, "Payment":pmt, "Principal":princ, "Interest":inte, "Balance":max(0, bal)})
 
         df = pd.DataFrame(data)
-        st.dataframe(df, width=None, use_container_width=True)
+        st.dataframe(df, width=None)
         
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download CSV", csv, "schedule.csv", "text/csv")
