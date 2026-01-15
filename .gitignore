@@ -1,0 +1,9 @@
+# Python junk
+__pycache__/
+*.pyc
+
+# Mac junk
+.DS_Store
+
+# Streamlit secrets (NEVER UPLOAD THIS)
+.streamlit/secrets.toml
