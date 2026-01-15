@@ -10,51 +10,58 @@ from dateutil.relativedelta import relativedelta
 import altair as alt
 
 # ==========================================
-# --- CONFIGURATION ---
+# --- CONFIGURATION (SECURE) ---
 # ==========================================
-# Hardcoded for local stability
-CLIENT_ID = '9875082b-f122-4c7f-bc05-8a26a786671a'
-TENANT_ID = 'common' 
-AUTHORITY_URL = f'https://login.microsoftonline.com/{TENANT_ID}'
-
-ONEDRIVE_ROOT = '/Moco'
-ONEDRIVE_DB_PATH = f'{ONEDRIVE_ROOT}/case_book_db.xlsx' 
-ONEDRIVE_PAYMENTS_PATH = f'{ONEDRIVE_ROOT}/Payments'
+try:
+    CLIENT_ID = st.secrets["azure"]["client_id"]
+    TENANT_ID = st.secrets["azure"]["tenant_id"]
+    AUTHORITY_URL = f"https://login.microsoftonline.com/{TENANT_ID}"
+    
+    ONEDRIVE_ROOT = st.secrets["onedrive"]["root_folder"]
+    ONEDRIVE_DB_PATH = f'{ONEDRIVE_ROOT}/case_book_db.xlsx' 
+    ONEDRIVE_PAYMENTS_PATH = f'{ONEDRIVE_ROOT}/Payments'
+except Exception as e:
+    st.error(f"Missing secrets: {e}. Please add them in Streamlit Cloud settings.")
+    st.stop()
 
 ENTITIES = ['sales', 'underwriter', 'client']
+SCOPES = ['Files.ReadWrite.All', 'User.Read']
 
 # ==========================================
-# --- AUTHENTICATION LOGIC ---
+# --- AUTHENTICATION LOGIC (DEVICE CODE) ---
 # ==========================================
 def get_access_token():
     if "onedrive_token" in st.session_state:
         return st.session_state["onedrive_token"]
-
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
-    scopes = ['Files.ReadWrite.All', 'User.Read']
-    
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(scopes, account=accounts[0])
-        if result and "access_token" in result:
-            st.session_state["onedrive_token"] = result['access_token']
-            return result['access_token']
     return None
 
-def trigger_login():
-    """Triggers browser popup and CLEARS OLD DATA on success."""
+def login_with_device_code():
+    """
+    Initiates Device Code Flow for headless environments (Streamlit Cloud).
+    """
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
-    result = app.acquire_token_interactive(scopes=['Files.ReadWrite.All', 'User.Read'])
     
+    # 1. Initiate flow
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        st.error("Failed to create device flow. Check Azure App registration.")
+        return
+    
+    # 2. Show Code to User
+    st.warning(f"⚠️ **Action Required**")
+    st.markdown(f"""
+    1. Go to: [{flow['verification_uri']}]({flow['verification_uri']})  
+    2. Enter code: **{flow['user_code']}** """)
+    
+    # 3. Wait for user to complete login (Blocking)
+    with st.spinner("Waiting for you to sign in..."):
+        result = app.acquire_token_by_device_flow(flow)
+    
+    # 4. Handle Result
     if "access_token" in result:
         st.session_state["onedrive_token"] = result['access_token']
-        
-        # --- THE FIX: Clear the empty "placeholder" data so it reloads ---
-        if 'df' in st.session_state:
-            del st.session_state['df']
-            
-        st.success("Logged in! Reloading data...")
-        st.rerun() 
+        st.success("Login Successful!")
+        st.rerun()
     else:
         st.error(f"Login failed: {result.get('error_description')}")
 
@@ -99,16 +106,9 @@ def load_excel_from_onedrive(path):
     if not token: return pd.DataFrame()
     headers = {'Authorization': 'Bearer ' + token}
     url = f'https://graph.microsoft.com/v1.0/me/drive/root:{path}:/content'
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return pd.read_excel(io.BytesIO(response.content), dtype=object)
-        elif response.status_code == 404:
-            st.toast("Database file not found on OneDrive. Creating new...", icon="⚠️")
-    except Exception as e:
-        st.error(f"Connection error: {e}")
-        
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return pd.read_excel(io.BytesIO(response.content), dtype=object)
     return pd.DataFrame()
 
 def save_excel_to_onedrive(df, path):
@@ -161,57 +161,45 @@ with st.sidebar:
     token = get_access_token()
     if token:
         st.success("✅ Connected")
-        if st.button("🔄 Force Reload Data"):
-            if 'df' in st.session_state: del st.session_state['df']
-            st.rerun()
     else:
         st.warning("⚠️ Disconnected")
         if st.button("🔌 Connect Microsoft"):
-            trigger_login()
+            login_with_device_code()
 
 def page_crm():
     st.title("UpShift CRM ☁️ (Excel on OneDrive)")
 
-    # 1. LOAD DATA LOGIC (FIXED)
-    # Check if we have data. If we are logged in but data is empty, try reloading.
-    needs_load = 'df' not in st.session_state
-    
-    if needs_load:
+    # 1. LOAD DATA
+    if 'df' not in st.session_state:
         if get_access_token():
-            with st.spinner("Downloading Database from OneDrive..."):
+            with st.spinner("Downloading Database..."):
                 st.session_state.df = load_excel_from_onedrive(ONEDRIVE_DB_PATH)
+                
+                # --- NORMALIZE COLUMNS ---
+                if not st.session_state.df.empty:
+                    st.session_state.df.columns = st.session_state.df.columns.str.strip().str.lower()
+                
+                required_cols = [
+                    "unique case number in system", "date added", "responsible entity", 
+                    "company name", "company number", "manager", "product type", 
+                    "phone", "email", "site", "sum", "has pledge", 
+                    "returning client", "comment", "done"
+                ]
+                
+                if st.session_state.df.empty:
+                    st.session_state.df = pd.DataFrame(columns=required_cols)
+                
+                for c in required_cols:
+                    if c not in st.session_state.df.columns:
+                        st.session_state.df[c] = None
+                
+                if 'done' in st.session_state.df.columns:
+                     st.session_state.df['done'] = st.session_state.df['done'].astype(str).str.title()
+                if 'sum' in st.session_state.df.columns:
+                     st.session_state.df['sum'] = pd.to_numeric(st.session_state.df['sum'], errors='coerce').fillna(0)
         else:
-            # Create a placeholder if NOT logged in
             st.info("Please connect to OneDrive in the sidebar.")
             st.session_state.df = pd.DataFrame()
-
-    # --- NORMALIZE COLUMNS ---
-    # Ensure standard columns exist even if file is empty
-    required_cols = [
-        "unique case number in system", "date added", "responsible entity", 
-        "company name", "company number", "manager", "product type", 
-        "phone", "email", "site", "sum", "has pledge", 
-        "returning client", "comment", "done"
-    ]
-    
-    if not st.session_state.df.empty:
-        st.session_state.df.columns = st.session_state.df.columns.str.strip().str.lower()
-    else:
-        # If logged in but file is empty, init columns
-        if get_access_token():
-            st.session_state.df = pd.DataFrame(columns=required_cols)
-
-    # Add missing columns safely
-    for c in required_cols:
-        if c not in st.session_state.df.columns:
-            st.session_state.df[c] = None
-    
-    # Types
-    if 'done' in st.session_state.df.columns:
-         st.session_state.df['done'] = st.session_state.df['done'].astype(str).str.title()
-    if 'sum' in st.session_state.df.columns:
-         st.session_state.df['sum'] = pd.to_numeric(st.session_state.df['sum'], errors='coerce').fillna(0)
-
 
     def save_data():
         with st.spinner("Syncing..."):
@@ -309,13 +297,12 @@ def page_crm():
             curr = pd.DataFrame()
 
         if view_mode:
-            # Check if product type exists before mapping
             if 'product type' in curr.columns:
-                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, use_container_width=True, hide_index=True)
             else:
-                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, use_container_width=True, hide_index=True)
         else:
-            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, width=None, hide_index=True, num_rows="dynamic")
+            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, use_container_width=True, hide_index=True, num_rows="dynamic")
             if not edited.equals(curr):
                 st.session_state.df.update(edited)
                 st.rerun()
@@ -354,7 +341,7 @@ def page_archive():
         c1, c2 = st.columns(2)
         c1.metric("Total", len(done))
         c2.metric("Sum", f"£{pd.to_numeric(done['sum'], errors='coerce').sum():,.2f}")
-        st.dataframe(done, width=None, hide_index=True)
+        st.dataframe(done, use_container_width=True, hide_index=True)
 
 def page_loans():
     st.title("Loan Management (Cloud)")
@@ -377,7 +364,7 @@ def page_loans():
     
     st.altair_chart(alt.Chart(df).mark_bar().encode(
         x='Date:T', y='Sum:Q', color='Case ID:N', tooltip=['Date', 'Case ID', 'Sum']
-    ).interactive(), width=None)
+    ).interactive(), use_container_width=True)
 
 def page_calculator():
     st.title("🧮 Calculator")
@@ -422,7 +409,7 @@ def page_calculator():
                 data.append({"Period":i, "Date":curr, "Payment":pmt, "Principal":princ, "Interest":inte, "Balance":max(0, bal)})
 
         df = pd.DataFrame(data)
-        st.dataframe(df, width=None)
+        st.dataframe(df, use_container_width=True)
         
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download CSV", csv, "schedule.csv", "text/csv")
