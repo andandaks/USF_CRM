@@ -298,11 +298,11 @@ def page_crm():
 
         if view_mode:
             if 'product type' in curr.columns:
-                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, use_container_width=True, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, width='stretch', hide_index=True)
             else:
-                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, use_container_width=True, hide_index=True)
+                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, width='stretch', hide_index=True)
         else:
-            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, use_container_width=True, hide_index=True, num_rows="dynamic")
+            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, width='stretch', hide_index=True, num_rows="dynamic")
             if not edited.equals(curr):
                 st.session_state.df.update(edited)
                 st.rerun()
@@ -341,7 +341,7 @@ def page_archive():
         c1, c2 = st.columns(2)
         c1.metric("Total", len(done))
         c2.metric("Sum", f"£{pd.to_numeric(done['sum'], errors='coerce').sum():,.2f}")
-        st.dataframe(done, use_container_width=True, hide_index=True)
+        st.dataframe(done, width='stretch', hide_index=True)
 
 def page_loans():
     st.title("Loan Management (Cloud)")
@@ -364,7 +364,7 @@ def page_loans():
     
     st.altair_chart(alt.Chart(df).mark_bar().encode(
         x='Date:T', y='Sum:Q', color='Case ID:N', tooltip=['Date', 'Case ID', 'Sum']
-    ).interactive(), use_container_width=True)
+    ).interactive(), width='stretch')
 
 def page_calculator():
     st.title("🧮 Calculator")
@@ -409,7 +409,7 @@ def page_calculator():
                 data.append({"Period":i, "Date":curr, "Payment":pmt, "Principal":princ, "Interest":inte, "Balance":max(0, bal)})
 
         df = pd.DataFrame(data)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
         
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download CSV", csv, "schedule.csv", "text/csv")
