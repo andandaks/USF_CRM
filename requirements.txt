@@ -4,6 +4,3 @@ sqlalchemy
 pyodbc
 msal
 requests
-altair
-openpyxl
-python-dateutil
