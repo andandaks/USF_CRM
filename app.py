@@ -5,65 +5,126 @@ import requests
 import msal
 import io
 import os
+import urllib
 from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 import altair as alt
+from sqlalchemy import create_engine, text
 
 # ==========================================
-# --- CONFIGURATION (SECURE) ---
+# --- CONFIGURATION (FROM SECRETS) ---
 # ==========================================
-try:
-    CLIENT_ID = st.secrets["azure"]["client_id"]
-    TENANT_ID = st.secrets["azure"]["tenant_id"]
-    AUTHORITY_URL = f"https://login.microsoftonline.com/{TENANT_ID}"
-    
-    ONEDRIVE_ROOT = st.secrets["onedrive"]["root_folder"]
-    ONEDRIVE_DB_PATH = f'{ONEDRIVE_ROOT}/case_book_db.xlsx' 
-    ONEDRIVE_PAYMENTS_PATH = f'{ONEDRIVE_ROOT}/Payments'
-except Exception as e:
-    st.error(f"Missing secrets: {e}. Please add them in Streamlit Cloud settings.")
+
+# Проверка наличия секретов перед запуском
+if "database" not in st.secrets or "microsoft" not in st.secrets:
+    st.error("❌ Файл .streamlit/secrets.toml не найден или не настроен.")
     st.stop()
 
+# 1. AZURE SQL DATABASE DETAILS
+DB_SERVER = st.secrets["database"]["server"]
+DB_NAME = st.secrets["database"]["name"]
+DB_USER = st.secrets["database"]["user"]
+DB_PASSWORD = st.secrets["database"]["password"]
+DB_DRIVER = st.secrets["database"]["driver"]
+
+# 2. ONEDRIVE CONFIG
+CLIENT_ID = st.secrets["microsoft"]["client_id"]
+TENANT_ID = st.secrets["microsoft"]["tenant_id"]
+ONEDRIVE_ROOT = '/Moco'
+ONEDRIVE_PAYMENTS_PATH = f'{ONEDRIVE_ROOT}/Payments'
+
 ENTITIES = ['sales', 'underwriter', 'client']
-SCOPES = ['Files.ReadWrite.All', 'User.Read']
 
 # ==========================================
-# --- AUTHENTICATION LOGIC (DEVICE CODE) ---
+# --- DATABASE ENGINE (SQL) ---
+# ==========================================
+@st.cache_resource
+def get_db_engine():
+    """Creates a secure connection pool to Azure SQL."""
+    params = urllib.parse.quote_plus(
+        f"DRIVER={{{DB_DRIVER}}};"
+        f"SERVER={{tcp:{DB_SERVER},1433}};"
+        f"DATABASE={{{DB_NAME}}};"
+        f"UID={{{DB_USER}}};"
+        f"PWD={{{DB_PASSWORD}}};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    )
+    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+
+def init_db():
+    """
+    1. Creates table if not exists with STRICT TYPES.
+    2. Auto-migrates (adds) new columns if they are missing.
+    """
+    engine = get_db_engine()
+    
+    # 1. Basic Create
+    create_table_query = """
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='crm_cases' and xtype='U')
+    CREATE TABLE crm_cases (
+        [unique case number in system] BIGINT PRIMARY KEY,
+        [date added] NVARCHAR(50),
+        [responsible entity] NVARCHAR(50),
+        [company name] NVARCHAR(255),
+        [company number] NVARCHAR(50),
+        [manager] NVARCHAR(100),
+        [product type] NVARCHAR(50),
+        [phone] NVARCHAR(50),
+        [email] NVARCHAR(100),
+        [site] NVARCHAR(100),
+        [sum] FLOAT,
+        [has pledge] NVARCHAR(10),
+        [returning client] NVARCHAR(10),
+        [comment] NVARCHAR(MAX),
+        [done] NVARCHAR(10),
+        [kyc] NVARCHAR(20),
+        [aml] NVARCHAR(20),
+        [soft_check] NVARCHAR(20),
+        [equifax_score] INT
+    )
+    """
+    
+    # 2. Migration Columns (Safe to run every time)
+    alter_queries = [
+        "IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'crm_cases') AND name = 'kyc') ALTER TABLE crm_cases ADD [kyc] NVARCHAR(20)",
+        "IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'crm_cases') AND name = 'aml') ALTER TABLE crm_cases ADD [aml] NVARCHAR(20)",
+        "IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'crm_cases') AND name = 'soft_check') ALTER TABLE crm_cases ADD [soft_check] NVARCHAR(20)",
+        "IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'crm_cases') AND name = 'equifax_score') ALTER TABLE crm_cases ADD [equifax_score] INT"
+    ]
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(create_table_query))
+            for q in alter_queries:
+                conn.execute(text(q))
+            conn.commit()
+    except Exception as e:
+        st.error(f"Database Connection Error: {e}. Check password/firewall.")
+
+# ==========================================
+# --- ONEDRIVE AUTH (STABLE) ---
 # ==========================================
 def get_access_token():
     if "onedrive_token" in st.session_state:
         return st.session_state["onedrive_token"]
+
+    app = msal.PublicClientApplication(CLIENT_ID, authority=f'https://login.microsoftonline.com/{TENANT_ID}')
+    scopes = ['Files.ReadWrite.All', 'User.Read']
+    
+    accounts = app.get_accounts()
+    if accounts:
+        result = app.acquire_token_silent(scopes, account=accounts[0])
+        if result and "access_token" in result:
+            st.session_state["onedrive_token"] = result['access_token']
+            return result['access_token']
     return None
 
-def login_with_device_code():
-    """
-    Initiates Device Code Flow for headless environments (Streamlit Cloud).
-    """
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_URL)
-    
-    # 1. Initiate flow
-    flow = app.initiate_device_flow(scopes=SCOPES)
-    if "user_code" not in flow:
-        st.error("Failed to create device flow. Check Azure App registration.")
-        return
-    
-    # 2. Show Code to User
-    st.warning(f"⚠️ **Action Required**")
-    st.markdown(f"""
-    1. Go to: [{flow['verification_uri']}]({flow['verification_uri']})  
-    2. Enter code: **{flow['user_code']}** """)
-    
-    # 3. Wait for user to complete login (Blocking)
-    with st.spinner("Waiting for you to sign in..."):
-        result = app.acquire_token_by_device_flow(flow)
-    
-    # 4. Handle Result
+def trigger_login():
+    app = msal.PublicClientApplication(CLIENT_ID, authority=f'https://login.microsoftonline.com/{TENANT_ID}')
+    result = app.acquire_token_interactive(scopes=['Files.ReadWrite.All', 'User.Read'])
     if "access_token" in result:
         st.session_state["onedrive_token"] = result['access_token']
-        st.success("Login Successful!")
         st.rerun()
-    else:
-        st.error(f"Login failed: {result.get('error_description')}")
 
 # ==========================================
 # --- CLOUD HELPERS ---
@@ -100,33 +161,6 @@ def list_files_in_deal_folder(deal_id):
     except: pass
     return []
 
-# --- EXCEL OPERATIONS ---
-def load_excel_from_onedrive(path):
-    token = get_access_token()
-    if not token: return pd.DataFrame()
-    headers = {'Authorization': 'Bearer ' + token}
-    url = f'https://graph.microsoft.com/v1.0/me/drive/root:{path}:/content'
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return pd.read_excel(io.BytesIO(response.content), dtype=object)
-    return pd.DataFrame()
-
-def save_excel_to_onedrive(df, path):
-    token = get_access_token()
-    if not token: return
-    headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False)
-    data = output.getvalue()
-    
-    url = f'https://graph.microsoft.com/v1.0/me/drive/root:{path}:/content'
-    res = requests.put(url, headers=headers, data=data)
-    if res.status_code in [200, 201]:
-        st.toast("Saved to Cloud!", icon="☁️")
-    else:
-        st.error(f"Save failed: {res.text}")
-
 @st.cache_data(ttl=300)
 def load_all_payments_from_cloud():
     token = get_access_token()
@@ -160,57 +194,53 @@ with st.sidebar:
     st.title("Authentication")
     token = get_access_token()
     if token:
-        st.success("✅ Connected")
+        st.success("✅ Connected to OneDrive")
     else:
         st.warning("⚠️ Disconnected")
         if st.button("🔌 Connect Microsoft"):
-            login_with_device_code()
+            trigger_login()
+
+# --- SQL DB HELPERS ---
+def load_data_sql():
+    """Loads all cases from SQL DB."""
+    try:
+        return pd.read_sql("SELECT * FROM crm_cases", get_db_engine())
+    except:
+        return pd.DataFrame()
+
+def save_new_case_sql(data):
+    """Appends a single new case to SQL DB."""
+    df = pd.DataFrame([data])
+    df.to_sql('crm_cases', get_db_engine(), if_exists='append', index=False)
+
+def update_table_sql(df):
+    """
+    Updates the entire table safely.
+    DELETE + APPEND logic to preserve schema.
+    """
+    engine = get_db_engine()
+    if df.empty:
+        return 
+    
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM crm_cases"))
+        
+    df.to_sql('crm_cases', engine, if_exists='append', index=False)
 
 def page_crm():
-    st.title("UpShift CRM ☁️ (Excel on OneDrive)")
-
-    # 1. LOAD DATA
+    st.title("UpShift CRM 🗄️ (SQL + Cloud)")
+    
+    # 1. Initialize & Load
+    init_db()
+    
+    # Всегда подгружаем свежие данные при старте
     if 'df' not in st.session_state:
-        if get_access_token():
-            with st.spinner("Downloading Database..."):
-                st.session_state.df = load_excel_from_onedrive(ONEDRIVE_DB_PATH)
-                
-                # --- NORMALIZE COLUMNS ---
-                if not st.session_state.df.empty:
-                    st.session_state.df.columns = st.session_state.df.columns.str.strip().str.lower()
-                
-                required_cols = [
-                    "unique case number in system", "date added", "responsible entity", 
-                    "company name", "company number", "manager", "product type", 
-                    "phone", "email", "site", "sum", "has pledge", 
-                    "returning client", "comment", "done"
-                ]
-                
-                if st.session_state.df.empty:
-                    st.session_state.df = pd.DataFrame(columns=required_cols)
-                
-                for c in required_cols:
-                    if c not in st.session_state.df.columns:
-                        st.session_state.df[c] = None
-                
-                if 'done' in st.session_state.df.columns:
-                     st.session_state.df['done'] = st.session_state.df['done'].astype(str).str.title()
-                if 'sum' in st.session_state.df.columns:
-                     st.session_state.df['sum'] = pd.to_numeric(st.session_state.df['sum'], errors='coerce').fillna(0)
-        else:
-            st.info("Please connect to OneDrive in the sidebar.")
-            st.session_state.df = pd.DataFrame()
-
-    def save_data():
-        with st.spinner("Syncing..."):
-            save_excel_to_onedrive(st.session_state.df, ONEDRIVE_DB_PATH)
+        st.session_state.df = load_data_sql()
 
     # Styling
     def color_prod(val):
-        c = {"term loan": "#D6EAF8", "credit line": "#A9CCE3", "invoice factoring": "#E8F8F5", "other": "#F2F3F4", 
-             "Term Loan": "#D6EAF8", "Credit Line": "#A9CCE3", "Invoice Factoring": "#E8F8F5", "Other": "#F2F3F4"}
+        c = {"Term Loan": "#D6EAF8", "Credit Line": "#A9CCE3", "Invoice Factoring": "#E8F8F5", "Other": "#F2F3F4"}
         return f'background-color: {c.get(val, "")}; color: black' if val in c else ''
-        
     def highlight_null(row):
         styles = [''] * len(row)
         if row.isna().any():
@@ -218,72 +248,99 @@ def page_crm():
             except: pass
         return styles
 
-    # 2. Add Case
+    # 2. Add Case Form
     with st.expander("➕ Add New Case", expanded=True):
         with st.form("add_case"):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                client = st.text_input("Client Name *")
-                co_num = st.text_input("Company Number")
-                mgr = st.text_input("Manager")
-                prod = st.selectbox("Product", ["Term Loan", "Credit Line", "Invoice Factoring", "Other"])
-            with c2:
-                phone = st.text_input("Phone")
-                email = st.text_input("Email")
-                site = st.text_input("Website")
-                loan = st.number_input("Sum (£)", step=1000.0)
-            with c3:
-                pledge = st.toggle("Pledge?")
-                ret = st.toggle("Returning?")
-                comm = st.text_area("Comments")
+            st.write("Enter details for new inquiry:")
             
+            # Row 1
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: client = st.text_input("Client Name *")
+            with c2: co_num = st.text_input("Company Number")
+            with c3: mgr = st.text_input("Manager")
+            with c4: assigned = st.selectbox("Assigned To", ENTITIES)
+            
+            # Row 2
+            c5, c6, c7, c8 = st.columns(4)
+            with c5: phone = st.text_input("Phone")
+            with c6: email = st.text_input("Email")
+            with c7: site = st.text_input("Website")
+            with c8: prod = st.selectbox("Product", ["Term Loan", "Credit Line", "Invoice Factoring", "Other"])
+
+            # Row 3 (Compliance)
+            st.markdown("**Compliance & Scores**")
+            c9, c10, c11, c12 = st.columns(4)
+            with c9: kyc = st.selectbox("KYC Status", ["N/A", "Passed", "No"])
+            with c10: aml = st.selectbox("AML Status", ["N/A", "Passed", "No"])
+            with c11: soft = st.selectbox("Soft Check", ["N/A", "Passed", "No"])
+            with c12: equifax = st.number_input("Equifax Score", 0, 999, 0)
+            
+            # Row 4
+            c13, c14, c15 = st.columns(3)
+            with c13: loan = st.number_input("Sum (£)", step=1000.0)
+            with c14: pledge = st.toggle("Pledge?")
+            with c15: ret = st.toggle("Returning?")
+            
+            comm = st.text_area("Comments")
             files = st.file_uploader("📂 Initial Files", accept_multiple_files=True)
 
             if st.form_submit_button("Create Case", type="primary"):
                 if not client:
                     st.error("Client Name Required")
-                elif not get_access_token():
-                    st.error("Connect to OneDrive first!")
                 else:
                     nid = random.randint(100000, 999999)
                     data = {
                         "unique case number in system": nid,
                         "date added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "responsible entity": "sales",
+                        "responsible entity": assigned, 
                         "company name": client, "company number": co_num, "manager": mgr,
                         "product type": prod, "phone": phone, "email": email, "site": site,
                         "sum": loan, "has pledge": "Yes" if pledge else "No",
-                        "returning client": "Yes" if ret else "No", "comment": comm, "done": "No"
+                        "returning client": "Yes" if ret else "No", "comment": comm, "done": "No",
+                        "kyc": kyc, "aml": aml, "soft_check": soft, "equifax_score": equifax
                     }
-                    new_row = pd.DataFrame([data]).astype(object)
-                    st.session_state.df = pd.concat([st.session_state.df, new_row], ignore_index=True)
                     
-                    save_data()
-                    create_deal_folder(nid)
-                    if files:
-                        for f in files: upload_file_to_folder(nid, f)
-                        st.toast("Files Uploaded!")
+                    # SQL Save
+                    save_new_case_sql(data)
+                    
+                    # Update Local State
+                    st.session_state.df = load_data_sql()
+                    
+                    # Cloud Operations
+                    if get_access_token():
+                        create_deal_folder(nid)
+                        if files:
+                            for f in files: upload_file_to_folder(nid, f)
+                            st.toast("Files Uploaded!", icon="📂")
+                    
+                    st.success("Case Created & Saved to DB!")
                     st.rerun()
 
     st.markdown("---")
     
-    # 3. Table
+    # 3. Main Table
     col_l, col_r = st.columns([2, 8])
     with col_l: view_mode = st.toggle("Show Formatting", value=True)
     with col_r: 
-        if st.button("💾 Force Sync"): save_data()
+        if st.button("💾 Save Edits to SQL", type="primary"):
+            update_table_sql(st.session_state.df)
+            st.success("Database Updated Successfully!")
+            st.session_state.df = load_data_sql() 
 
     conf = {
-        "responsible entity": st.column_config.SelectboxColumn("Entity", options=ENTITIES, required=True),
+        "responsible entity": st.column_config.SelectboxColumn("Assigned To", options=ENTITIES, required=True),
         "unique case number in system": st.column_config.NumberColumn("ID", format="%d", disabled=True),
         "sum": st.column_config.NumberColumn("Sum", format="£%.2f"),
         "done": st.column_config.SelectboxColumn("Done?", options=["Yes", "No"], required=True),
         "product type": st.column_config.SelectboxColumn("Product", options=["Term Loan", "Credit Line", "Invoice Factoring", "Other"], required=True),
-        "date added": st.column_config.TextColumn("Date", disabled=True),
-        "comment": st.column_config.TextColumn("Comment", width="large")
+        "comment": st.column_config.TextColumn("Comment", width="large"),
+        "kyc": st.column_config.SelectboxColumn("KYC", options=["N/A", "Passed", "No"]),
+        "aml": st.column_config.SelectboxColumn("AML", options=["N/A", "Passed", "No"]),
+        "soft_check": st.column_config.SelectboxColumn("Soft Check", options=["N/A", "Passed", "No"]),
+        "equifax_score": st.column_config.NumberColumn("Equifax", format="%d")
     }
 
-    if not st.session_state.df.empty and 'done' in st.session_state.df.columns:
+    if 'done' in st.session_state.df.columns:
         mask = st.session_state.df['done'] != "Yes"
     else:
         mask = [True] * len(st.session_state.df)
@@ -293,60 +350,57 @@ def page_crm():
         
         if 'responsible entity' in st.session_state.df.columns:
             curr = st.session_state.df.loc[(st.session_state.df['responsible entity'] == ent) & mask]
-        else:
-            curr = pd.DataFrame()
-
-        if view_mode:
-            if 'product type' in curr.columns:
-                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), width=None, use_container_width=True, hide_index=True)
+            
+            if view_mode:
+                st.dataframe(curr.style.apply(highlight_null, axis=1).map(color_prod, subset=['product type']), use_container_width=True, hide_index=True)
             else:
-                st.dataframe(curr.style.apply(highlight_null, axis=1), width=None, use_container_width=True, hide_index=True)
-        else:
-            edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, use_container_width=True, hide_index=True, num_rows="dynamic")
-            if not edited.equals(curr):
-                st.session_state.df.update(edited)
-                st.rerun()
+                edited = st.data_editor(curr, key=f"ed_{ent}", column_config=conf, use_container_width=True, hide_index=True, num_rows="dynamic")
+                if not edited.equals(curr):
+                    st.session_state.df.update(edited)
+                    st.warning("Unsaved changes. Click 'Save Edits' above.")
 
     # 4. File Manager
     st.markdown("---")
     st.header("📂 File Manager")
     
-    if get_access_token() and not st.session_state.df.empty:
-        if 'unique case number in system' in st.session_state.df.columns:
-            ids = sorted(st.session_state.df['unique case number in system'].unique(), reverse=True)
-            c_sel, c_up = st.columns([1, 2])
-            
-            with c_sel:
-                sid = st.selectbox("Select Case", ids)
-                if sid:
-                    st.caption(f"Files in Moco/{sid}:")
-                    for f in list_files_in_deal_folder(sid): st.text(f"📄 {f}")
-            
-            with c_up:
-                if sid:
-                    u_files = st.file_uploader("Add Files", accept_multiple_files=True, key=f"up_{sid}")
-                    if u_files and st.button("Upload"):
-                        for f in u_files: upload_file_to_folder(sid, f)
-                        st.success("Uploaded!")
-                        st.rerun()
+    if get_access_token():
+        ids = sorted(st.session_state.df['unique case number in system'].unique(), reverse=True) if not st.session_state.df.empty else []
+        c_sel, c_up = st.columns([1, 2])
+        
+        with c_sel:
+            sid = st.selectbox("Select Case", ids)
+            if sid:
+                st.caption(f"Files in Moco/{sid}:")
+                for f in list_files_in_deal_folder(sid): st.text(f"📄 {f}")
+        
+        with c_up:
+            if sid:
+                u_files = st.file_uploader("Add Files", accept_multiple_files=True, key=f"up_{sid}")
+                if u_files and st.button("Upload"):
+                    for f in u_files: upload_file_to_folder(sid, f)
+                    st.success("Uploaded!")
+                    st.rerun()
+    else:
+        st.info("Connect to OneDrive in the sidebar to manage files.")
 
 def page_archive():
     st.title("✅ Archive")
-    if 'df' not in st.session_state or st.session_state.df.empty: 
-        st.info("No data.")
-        return
+    if st.button("Refresh Archive"):
+        st.session_state.df = load_data_sql()
+        
+    if 'df' not in st.session_state: st.session_state.df = load_data_sql()
+    if st.session_state.df.empty: return
     
-    if 'done' in st.session_state.df.columns:
-        done = st.session_state.df[st.session_state.df['done'] == "Yes"]
-        c1, c2 = st.columns(2)
-        c1.metric("Total", len(done))
-        c2.metric("Sum", f"£{pd.to_numeric(done['sum'], errors='coerce').sum():,.2f}")
-        st.dataframe(done, use_container_width=True, hide_index=True)
+    done = st.session_state.df[st.session_state.df['done'] == "Yes"]
+    c1, c2 = st.columns(2)
+    c1.metric("Total", len(done))
+    c2.metric("Sum", f"£{done['sum'].sum():,.2f}")
+    st.dataframe(done, use_container_width=True, hide_index=True)
 
 def page_loans():
     st.title("Loan Management (Cloud)")
     if not get_access_token():
-        st.warning("Please connect to OneDrive.")
+        st.warning("Please connect to OneDrive in the sidebar.")
         return
 
     with st.spinner("Loading Payments..."):
@@ -410,7 +464,6 @@ def page_calculator():
 
         df = pd.DataFrame(data)
         st.dataframe(df, use_container_width=True)
-        
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download CSV", csv, "schedule.csv", "text/csv")
 
