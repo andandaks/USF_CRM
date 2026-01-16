@@ -5,3 +5,4 @@ msal
 xlsxwriter
 altair
 python-dateutil
+sqlalchemy
