@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
+import uuid
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="UpShift Finance CRM", layout="wide")
@@ -33,7 +34,7 @@ with st.expander("➕ Add New Case", expanded=False):
         
         # Row 1: Core Info
         c1, c2, c3, c4 = st.columns(4)
-        unique_id = c1.text_input("Unique Case Number (Optional)", help="Leave empty if auto-generated")
+        unique_id = c1.text_input("Unique Case Number (Optional)", value = uuid.uuid4())
         date_added = c2.date_input("Date Added", value=datetime.today())
         manager = c3.text_input("Manager")
         resp_entity = c4.text_input("Responsible Entity")
