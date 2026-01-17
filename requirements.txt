@@ -1,6 +1,5 @@
 streamlit
 pandas
-sqlalchemy
 pyodbc
 msal
 requests
