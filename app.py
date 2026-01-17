@@ -14,7 +14,7 @@ try:
     DB_NAME = st.secrets["database"]["name"]
     DB_USER = st.secrets["database"]["user"]
     DB_PASSWORD = st.secrets["database"]["password"]
-    DB_DRIVER = 'ODBC Driver 17 for SQL Server'
+    DB_DRIVER = 'ODBC Driver 18 for SQL Server'
     
     # Azure
     CLIENT_ID = st.secrets["azure"]["client_id"]
