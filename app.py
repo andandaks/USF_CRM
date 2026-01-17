@@ -8,6 +8,7 @@ import requests
 import base64
 from datetime import datetime
 from io import BytesIO
+from sqlalchemy import create_engine, URL
 
 # --- CONFIGURATION ---
 try:
@@ -29,26 +30,22 @@ except Exception:
 
 # --- DATABASE CONNECTION (SQLAlchemy) ---
 def get_db_engine():
-    # 1. Detect Environment & Select Driver
-    if sys.platform == "linux":
-        # Streamlit Cloud (Linux) -> Use FreeTDS
-        driver = 'FreeTDS'
-        # FreeTDS requires specific syntax in the connection string for Azure
-        params = urllib.parse.quote_plus(
-            f"DRIVER={{{driver}}};SERVER={DB_SERVER};PORT=1433;DATABASE={DB_NAME};"
-            f"UID={DB_USER};PWD={DB_PASSWORD};TDS_Version=7.4;"
-        )
-    else:
-        # Local (Windows) -> Use ODBC Driver 18 (as in your snippet)
-        driver = 'ODBC Driver 18 for SQL Server'
-        params = urllib.parse.quote_plus(
-            f"DRIVER={{{driver}}};SERVER={DB_SERVER};DATABASE={DB_NAME};"
-            f"UID={DB_USER};PWD={DB_PASSWORD};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
-        )
-
-    # 2. Create SQLAlchemy Engine
-    # We use the standard pyodbc connection string wrapped in SQLAlchemy
-    connection_url = f"mssql+pyodbc:///?odbc_connect={params}"
+    # We use 'mssql+pytds' which requires NO system drivers.
+    # It works on Windows, Mac, and Linux (Streamlit Cloud) automatically.
+    
+    connection_url = URL.create(
+        "mssql+pytds",
+        username=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_SERVER,
+        port=1433,
+        database=DB_NAME,
+        query={
+            "encrypt": "yes",         # Required for Azure SQL
+            "trust_server_certificate": "no"
+        }
+    )
+    
     engine = create_engine(connection_url)
     return engine
 
