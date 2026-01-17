@@ -1,5 +1,7 @@
 streamlit
 pandas
 pyodbc
+sqlalchemy
+openpyxl
 msal
 requests
