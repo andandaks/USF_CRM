@@ -1,5 +1,5 @@
 unixodbc
 unixodbc-dev
-curl
-gnupg
-apt-transport-https
+freetds-dev
+freetds-bin
+tdsodbc
