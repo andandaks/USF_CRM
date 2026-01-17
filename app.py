@@ -16,14 +16,14 @@ def init_connection():
     db_username = st.secrets["DB_USER"]
     db_password = st.secrets["DB_PASSWORD"]
     
-    # Connection String
+# Connection String
     params = urllib.parse.quote_plus(
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};" 
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};" # <--- Changed to 18
         f"SERVER={{tcp:{db_server},1433}};"
         f"DATABASE={{{db_database}}};"
         f"UID={{{db_username}}};"
         f"PWD={{{db_password}}};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=30;" # <--- Ensure TrustServerCertificate is yes for Driver 18
     )
     return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
